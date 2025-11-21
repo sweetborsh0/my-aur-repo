@@ -6,31 +6,48 @@ on:
       package:
         description: 'AUR package name (например php83)'
         required: true
+        type: string
 
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: write          # нужно для peaceiris/actions-gh-pages
+      contents: write
+      pages: write
+      id-token: write
+
     container:
       image: archlinux:base-devel
-      options: --privileged     # нужен для makepkg и pacstrap
-    steps:
-      - name: Установка зависимостей и создание обычного пользователя
-        run: |
-          pacman -Syu --noconfirm git sudo base-devel
-          useradd -m -G wheel builder
-          echo 'builder ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
-          # разрешаем makepkg от builder'а
-          sed -i 's/#MAKEFLAGS=.*/MAKEFLAGS="-j$(nproc)"/' /etc/makepkg.conf
+      options: --privileged
 
-      - name: Кэшируем ccache (ускоряет повторные сборки в 10–20 раз)
+    steps:
+      - name: Установка всего необходимого + создание пользователя
+        run: |
+          pacman -Syu --noconfirm git sudo ccache base-devel gnupg
+          useradd -m builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers.d/builder
+          mkdir -p /home/builder/.gnupg
+          chown builder:builder /home/builder/.gnupg
+
+      - name: Настройка makepkg и ccache
+        run: |
+          echo 'MAKEFLAGS="-j$(nproc)"' >> /etc/makepkg.conf
+          echo 'BUILDENV=(ccache !distcc color !sign)' >> /etc/makepkg.conf
+          echo 'OPTIONS=(strip docs !libtool !staticlibs emptydirs zipman purge !debug lto)' >> /etc/makepkg.conf
+          mkdir -p /home/builder/.ccache
+          chown builder:builder /home/builder/.ccache
+
+      - name: Кэш ccache
         uses: actions/cache@v4
         with:
           path: /home/builder/.ccache
           key: ccache-${{ github.event.inputs.package }}-${{ github.run_id }}
-          restore-keys: |
-            ccache-${{ github.event.inputs.package }}-
+          restore-keys: ccache-${{ github.event.inputs.package }}-
+
+      - name: Checkout репозитория (чтобы залить новые пакеты)
+        uses: actions/checkout@v4
+        with:
+          path: repo
 
       - name: Сборка пакета от обычного пользователя
         run: |
@@ -40,27 +57,32 @@ jobs:
             cd ${{ github.event.inputs.package }}
             makepkg -s --noconfirm --needed
             mkdir -p /tmp/repo/x86_64
-            mv *.pkg.tar.zst /tmp/repo/x86_64/
+            mv *.pkg.tar.* /tmp/repo/x86_64/
           "
 
-      - name: Копируем собранные пакеты в репозиторий
+      - name: Подготовка директории x86_64 и удаление старых версий этого пакета
         run: |
-          mkdir -p x86_64
-          cp /tmp/repo/x86_64/*.pkg.tar.zst x86_64/ || true
+          mkdir -p repo/x86_64
+          cd repo/x86_64
+          rm -f ${{ github.event.inputs.package }}-[0-9]*.pkg.tar.*
 
-      - name: Обновляем базу репозитория (repo-add)
+      - name: Копирование новых пакетов
         run: |
-          cd x86_64
-          # удаляем старые ссылки
-          rm -f my-aur-repo.{db,files}.tar.gz
-          repo-add my-aur-repo.db.tar.gz *.pkg.tar.zst
+          cp /tmp/repo/x86_64/* repo/x86_64/ || true
+
+      - name: Обновление базы репозитория
+        run: |
+          cd repo/x86_64
+          # Удаляем старые базы и симлинки
+          rm -f my-aur-repo.{db,files}{,.tar.gz,.tar.gz.old,.sig}
+          repo-add -n -R my-aur-repo.db.tar.gz *.pkg.tar.*
 
       - name: Деплой на GitHub Pages
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./x86_64
+          publish_dir: ./repo/x86_64
           force_orphan: true
           user_name: 'github-actions[bot]'
           user_email: 'github-actions[bot]@users.noreply.github.com'
-          commit_message: 'Add ${{ github.event.inputs.package }}'
+          commit_message: 'Add/update ${{ github.event.inputs.package }}'
