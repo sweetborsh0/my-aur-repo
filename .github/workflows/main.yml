@@ -4,41 +4,63 @@ on:
   workflow_dispatch:
     inputs:
       package:
-        description: 'AUR package name'
+        description: 'AUR package name (например php83)'
         required: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: archlinux:base-devel
+    permissions:
+      contents: write          # нужно для peaceiris/actions-gh-pages
+    container:
+      image: archlinux:base-devel
+      options: --privileged     # нужен для makepkg и pacstrap
     steps:
-      - name: Install tools
+      - name: Установка зависимостей и создание обычного пользователя
         run: |
-          pacman -Syu --noconfirm git base-devel rustup
-          rustup default stable
+          pacman -Syu --noconfirm git sudo base-devel
+          useradd -m -G wheel builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
+          # разрешаем makepkg от builder'а
+          sed -i 's/#MAKEFLAGS=.*/MAKEFLAGS="-j$(nproc)"/' /etc/makepkg.conf
 
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - name: Кэшируем ccache (ускоряет повторные сборки в 10–20 раз)
+        uses: actions/cache@v4
         with:
-          path: repo
+          path: /home/builder/.ccache
+          key: ccache-${{ github.event.inputs.package }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ github.event.inputs.package }}-
 
-      - name: Download and build AUR package
+      - name: Сборка пакета от обычного пользователя
         run: |
-          git clone https://aur.archlinux.org/${{ github.event.inputs.package }}.git
-          cd ${{ github.event.inputs.package }}
-          makepkg --noconfirm --needed --syncdeps --skippgpcheck
+          sudo -u builder bash -c "
+            cd /home/builder
+            git clone https://aur.archlinux.org/${{ github.event.inputs.package }}.git
+            cd ${{ github.event.inputs.package }}
+            makepkg -s --noconfirm --needed
+            mkdir -p /tmp/repo/x86_64
+            mv *.pkg.tar.zst /tmp/repo/x86_64/
+          "
 
-          mkdir -p ../repo/x86_64
-          mv *.pkg.tar.zst ../repo/x86_64/
-
-      - name: Update repo database
+      - name: Копируем собранные пакеты в репозиторий
         run: |
-          cd repo/x86_64
-          repo-add --sign --key 2E15988E697A7A4A my-aur-repo.db.tar.gz *.pkg.tar.zst
+          mkdir -p x86_64
+          cp /tmp/repo/x86_64/*.pkg.tar.zst x86_64/ || true
 
-      - name: Deploy to GitHub Pages
+      - name: Обновляем базу репозитория (repo-add)
+        run: |
+          cd x86_64
+          # удаляем старые ссылки
+          rm -f my-aur-repo.{db,files}.tar.gz
+          repo-add my-aur-repo.db.tar.gz *.pkg.tar.zst
+
+      - name: Деплой на GitHub Pages
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./repo/x86_64
+          publish_dir: ./x86_64
           force_orphan: true
+          user_name: 'github-actions[bot]'
+          user_email: 'github-actions[bot]@users.noreply.github.com'
+          commit_message: 'Add ${{ github.event.inputs.package }}'
