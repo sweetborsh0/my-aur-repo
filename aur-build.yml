@@ -1,0 +1,44 @@
+name: AUR Build on demand
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: 'AUR package name'
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install tools
+        run: |
+          pacman -Syu --noconfirm git base-devel rustup
+          rustup default stable
+
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - name: Download and build AUR package
+        run: |
+          git clone https://aur.archlinux.org/${{ github.event.inputs.package }}.git
+          cd ${{ github.event.inputs.package }}
+          makepkg --noconfirm --needed --syncdeps --skippgpcheck
+
+          mkdir -p ../repo/x86_64
+          mv *.pkg.tar.zst ../repo/x86_64/
+
+      - name: Update repo database
+        run: |
+          cd repo/x86_64
+          repo-add --sign --key 2E15988E697A7A4A my-aur-repo.db.tar.gz *.pkg.tar.zst
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./repo/x86_64
+          force_orphan: true
